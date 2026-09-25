@@ -3,6 +3,7 @@ import { db } from './db.js'
 import { initEnergy, reconcileDevice, closeDevice, getSummary } from './energy.js'
 import {
   initQuota, evaluateAll, createQuota, updateQuota, deleteQuota,
+  batchApplyQuota, batchUpdateQuotas, batchHandleAlerts,
   handleAlert, listQuotas, listAlerts, getAdjustments, activeAlertCount
 } from './quota.js'
 import {
@@ -302,6 +303,42 @@ app.delete('/api/quota/:id', requirePerm('quota_manage'), (req, res) => {
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
+// ===== 批量策略：跨房间/设备统一套用定额 =====
+// 按「对象 + 周期」逐项 upsert（已有则调额并启用、没有则新建）；全批同一时刻统一评估，
+// 历史告警随评估迁移校准；每项写 quota_adjustments 并以 batch_id 归组（逐项审计）。
+app.post('/api/quota/batch-apply', requirePerm('quota_manage'), (req, res) => {
+  try {
+    const b = req.body || {}
+    const { batch_id, results } = batchApplyQuota(b)
+    const created = results.filter((r) => r.action === 'created')
+    const updated = results.filter((r) => r.action === 'updated')
+    const failed = results.filter((r) => r.action === 'failed')
+    log('定额', '批量套用定额',
+      `批次 ${batch_id}：${b.scope === 'room' ? '房间' : '设备'} ${created.length + updated.length} 个对象` +
+      `（新建 ${created.length}、调整 ${updated.length}${failed.length ? `、失败 ${failed.length}` : ''}），` +
+      `周期 ${b.period}，额度 ${Number(b.limit_kwh)}kWh` + (b.reason ? `；备注：${b.reason}` : ''),
+      { category: 'quota' })
+    res.json({ ok: failed.length === 0, batch_id, results })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 批量调整现有定额：统一改额度和/或换周期；换周期冲突逐项隔离报错，不中断整批
+app.post('/api/quota/batch-update', requirePerm('quota_manage'), (req, res) => {
+  try {
+    const b = req.body || {}
+    const { batch_id, results } = batchUpdateQuotas(b)
+    const updated = results.filter((r) => r.action === 'updated')
+    const failed = results.filter((r) => r.action === 'failed')
+    const parts = []
+    if (b.limit_kwh != null) parts.push(`额度→${Number(b.limit_kwh)}kWh`)
+    if (b.period) parts.push(`周期→${b.period}`)
+    log('定额', '批量调整定额',
+      `批次 ${batch_id}：${parts.join('，')}；成功 ${updated.length} 条` +
+      `${failed.length ? `、失败 ${failed.length} 条（${failed[0].error}）` : ''}` +
+      (b.reason ? `；备注：${b.reason}` : ''),
+      { category: 'quota' })
+    res.json({ ok: failed.length === 0, batch_id, results })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
 // 告警处理闭环：待处理 → 处理中 → 已处理/已忽略，可附处理备注
 app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req, res) => {
   try {
@@ -317,9 +354,27 @@ app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req,
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
-// 额度调整历史（不传 quota_id 时为全局最近 50 条）
+// 批量告警处理：同一状态流转逐条套用（每条仍走状态机校验），失败逐项返回不中断整批
+app.post('/api/quota-alerts/batch-handle', requirePerm('quota_alert_handle'), (req, res) => {
+  try {
+    const { status, note } = req.body || {}
+    const { results } = batchHandleAlerts(req.body || {})
+    const okItems = results.filter((r) => r.ok)
+    const failed = results.filter((r) => !r.ok)
+    const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: '重新打开/退回' }[status] || '更新状态'
+    const names = okItems.slice(0, 8).map((r) => r.target_name).join('、')
+    log('定额', `定额告警·批量${label}`,
+      `成功 ${okItems.length} 条${failed.length ? `、失败 ${failed.length} 条（${failed[0].error}）` : ''}` +
+      (names ? `：${names}${okItems.length > 8 ? ' 等' : ''}` : '') + (note ? `；备注：${note}` : ''),
+      { category: 'quota' })
+    res.json({ ok: failed.length === 0, results })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 额度调整历史（quota_id 查单条定额、batch_id 查整批逐项留痕、都不传为全局最近 50 条）
 app.get('/api/quota-adjustments', (req, res) => {
-  res.json(getAdjustments(req.query.quota_id ? Number(req.query.quota_id) : null))
+  res.json(getAdjustments(
+    req.query.quota_id ? Number(req.query.quota_id) : null,
+    req.query.batch_id || null))
 })
 
 // ===== 家庭共享管理：邀请 / 角色权限 / 撤销恢复 =====

@@ -213,8 +213,67 @@ export const useHomeStore = defineStore('home', {
         this.toastMsg('告警状态已更新', 'success')
       } catch (e) { this.toastMsg(e.message, 'warn') }
     },
-    async fetchAdjustments(quotaId = null) {
-      const qs = quotaId ? `?quota_id=${quotaId}` : ''
+    // ===== 批量策略：跨房间/设备套用与调整、批量告警处理 =====
+    // 结果均含逐项明细（results），失败项不中断整批；toast 汇总成败并附首个失败原因
+    async batchApplyQuota(form) {
+      try {
+        const r = await api('/quota/batch-apply', 'POST', {
+          scope: form.scope,
+          room_ids: form.scope === 'room' ? form.targets : [],
+          device_ids: form.scope === 'device' ? form.targets : [],
+          period: form.period,
+          limit_kwh: Number(form.limit_kwh),
+          reason: form.reason || ''
+        })
+        await this.load()
+        const c = r.results.filter((x) => x.action === 'created').length
+        const u = r.results.filter((x) => x.action === 'updated').length
+        const f = r.results.filter((x) => x.action === 'failed')
+        this.toastMsg(
+          f.length
+            ? `批量套用完成：新建 ${c}、调整 ${u}、失败 ${f.length}（${f[0].error}${f.length > 1 ? ' 等' : ''}）`
+            : `批量套用完成：新建 ${c}、调整 ${u}，已逐项留痕（批次 ${r.batch_id}）`,
+          f.length ? 'warn' : 'success')
+        return r
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
+    async batchUpdateQuotas(ids, patch) {
+      try {
+        const r = await api('/quota/batch-update', 'POST', {
+          quota_ids: ids,
+          limit_kwh: patch.limit_kwh !== '' && patch.limit_kwh != null ? Number(patch.limit_kwh) : null,
+          period: patch.period || null,
+          reason: patch.reason || ''
+        })
+        await this.load()
+        const u = r.results.filter((x) => x.action === 'updated').length
+        const f = r.results.filter((x) => x.action === 'failed')
+        this.toastMsg(
+          f.length
+            ? `批量调整完成：成功 ${u}、失败 ${f.length}（${f[0].error}${f.length > 1 ? ' 等' : ''}）`
+            : `批量调整完成：${u} 条已调整并逐项留痕（批次 ${r.batch_id}）`,
+          f.length ? 'warn' : 'success')
+        return r
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
+    async batchHandleQuotaAlerts(ids, status, note) {
+      try {
+        const r = await api('/quota-alerts/batch-handle', 'POST', { ids, status, note })
+        await this.load()
+        const okN = r.results.filter((x) => x.ok).length
+        const f = r.results.filter((x) => !x.ok)
+        this.toastMsg(
+          f.length
+            ? `批量处理完成：成功 ${okN}、失败 ${f.length}（${f[0].error}${f.length > 1 ? ' 等' : ''}）`
+            : `批量处理完成：${okN} 条告警已更新`,
+          f.length ? 'warn' : 'success')
+        return r
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
+    async fetchAdjustments(quotaId = null, batchId = null) {
+      const qs = batchId
+        ? `?batch_id=${encodeURIComponent(batchId)}`
+        : quotaId ? `?quota_id=${quotaId}` : ''
       return await api('/quota-adjustments' + qs)
     },
 

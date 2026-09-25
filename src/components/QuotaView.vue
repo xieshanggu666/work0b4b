@@ -14,8 +14,40 @@
     <div class="card">
       <div class="card-head">
         <h4>📏 周期能耗定额 · 按房间 / 设备配置</h4>
-        <button class="add" :disabled="!canManage" :title="canManage?'':'无定额配置管理权限'" @click="canManage && openCreate()">＋ 新建定额</button>
+        <div class="head-ops">
+          <button class="add" :disabled="!canManage" :title="canManage?'':'无定额配置管理权限'" @click="canManage && openCreate()">＋ 新建定额</button>
+          <button class="add batch" :disabled="!canManage" :title="canManage?'跨房间/设备统一套用定额':'无定额配置管理权限'" @click="canManage && openBatch()">＋ 批量配置</button>
+        </div>
       </div>
+
+      <!-- 批量套用表单：跨房间/设备统一设置同周期同额度 -->
+      <form v-if="batchShow" class="form batch-form" @submit.prevent="submitBatch">
+        <select v-model="batchForm.scope" @change="batchForm.targets=[]">
+          <option value="room">按房间</option>
+          <option value="device">按设备</option>
+        </select>
+        <div class="target-picker">
+          <label class="pick-all">
+            <input type="checkbox" :checked="allTargetsChecked" @change="toggleAllTargets" /> 全选（{{ batchForm.targets.length }}/{{ batchTargetOptions.length }}）
+          </label>
+          <label v-for="t in batchTargetOptions" :key="t.id">
+            <input type="checkbox" :value="t.id" v-model="batchForm.targets" /> {{ t.label }}
+          </label>
+        </div>
+        <select v-model="batchForm.period">
+          <option value="daily">每日</option>
+          <option value="weekly">每周（周一起）</option>
+          <option value="monthly">每月</option>
+        </select>
+        <label class="limit-in">额度
+          <input v-model.number="batchForm.limit_kwh" type="number" min="0.1" step="0.1" required placeholder="kWh" />
+          kWh
+        </label>
+        <input v-model="batchForm.reason" class="reason" placeholder="批量套用备注（可选，逐项留痕）" />
+        <button type="submit" class="save" :disabled="!batchForm.targets.length">批量套用（{{ batchForm.targets.length }} 个对象）</button>
+        <button type="button" class="ghost" @click="batchShow=false">取消</button>
+        <p class="batch-tip">按「对象 + 周期」逐项新建或更新（已停用将重新启用）；全批统一评估用量并迁移历史告警，每项单独留痕可整批追溯。</p>
+      </form>
 
       <!-- 新建/编辑表单 -->
       <form v-if="formShow" class="form" @submit.prevent="submit">
@@ -45,13 +77,37 @@
         <button type="button" class="ghost" @click="formShow=false">取消</button>
       </form>
 
+      <!-- 批量调整栏：勾选定额后统一改额度/换周期 -->
+      <div v-if="canManage && selectedQuotas.length" class="batch-bar">
+        <b>已选 {{ selectedQuotas.length }} 条定额</b>
+        <label class="limit-in">新额度
+          <input v-model="batchUpd.limit_kwh" type="number" min="0.1" step="0.1" placeholder="不变" />
+          kWh
+        </label>
+        <select v-model="batchUpd.period">
+          <option value="">周期不变</option>
+          <option value="daily">每日</option>
+          <option value="weekly">每周</option>
+          <option value="monthly">每月</option>
+        </select>
+        <input v-model="batchUpd.reason" class="reason" placeholder="批量调整备注（可选，逐项留痕）" />
+        <button class="save" :disabled="batchUpd.limit_kwh==='' && !batchUpd.period" @click="submitBatchUpdate">批量调整</button>
+        <button class="ghost" @click="selectedQuotas=[]">清除选择</button>
+      </div>
+
       <table v-if="store.quotas.length">
         <thead><tr>
+          <th v-if="canManage" class="sel">
+            <input type="checkbox" :checked="allQuotasChecked" @change="toggleAllQuotas" title="全选" />
+          </th>
           <th>对象</th><th>周期</th><th>额度</th><th style="width:26%">周期内用量</th>
           <th>状态</th><th>启用</th><th>操作</th>
         </tr></thead>
         <tbody>
           <tr v-for="q in store.quotas" :key="q.id" :class="{disabled:!q.enabled}">
+            <td v-if="canManage" class="sel">
+              <input type="checkbox" :value="q.id" v-model="selectedQuotas" />
+            </td>
             <td>
               <i class="tag" :class="q.scope">{{ q.scope==='room'?'房间':'设备' }}</i>
               {{ q.target_name }}
@@ -98,12 +154,26 @@
           <button v-for="f in alertFilters" :key="f.v" :class="{active: alertFilter===f.v}" @click="alertFilter=f.v">{{ f.t }}</button>
         </div>
       </div>
+      <!-- 批量处理栏：勾选告警后统一流转状态（每条仍走状态机校验，失败逐项提示） -->
+      <div v-if="canAlert && selectedAlerts.length" class="batch-bar">
+        <b>已选 {{ selectedAlerts.length }} 条告警</b>
+        <button class="go" @click="batchAct('handling')">开始处理</button>
+        <button class="ok-btn" @click="batchAct('resolved')">已处理</button>
+        <button @click="batchAct('ignored')">忽略</button>
+        <button class="ghost" @click="selectedAlerts=[]">清除选择</button>
+      </div>
       <table v-if="filteredAlerts.length">
         <thead><tr>
+          <th v-if="canAlert" class="sel">
+            <input type="checkbox" :checked="allAlertsChecked" @change="toggleAllAlerts" title="全选当前筛选" />
+          </th>
           <th>级别</th><th>对象</th><th>周期</th><th>用量/额度</th><th>状态</th><th>处理备注</th><th>时间</th><th>操作</th>
         </tr></thead>
         <tbody>
           <tr v-for="a in filteredAlerts" :key="a.id">
+            <td v-if="canAlert" class="sel">
+              <input type="checkbox" :value="a.id" v-model="selectedAlerts" />
+            </td>
             <td><span class="lv" :class="a.level">{{ a.level==='error'?'超标':'预警' }}</span></td>
             <td>{{ a.scope==='room'?'房间':'设备' }} · {{ a.target_name }}</td>
             <td>{{ a.period_label }}<br><span class="dim">{{ periodText(a) }}</span></td>
@@ -147,7 +217,11 @@
         <h4>🗂 定额历史调整记录</h4>
         <span v-if="historyQuota" class="chip">
           仅显示：定额 #{{ historyQuota }}
-          <button @click="historyQuota=null">✕ 清除</button>
+          <button @click="historyQuota=null; loadHistory()">✕ 清除</button>
+        </span>
+        <span v-if="historyBatch" class="chip batch-chip">
+          仅显示批次：{{ historyBatch }}
+          <button @click="historyBatch=null; loadHistory()">✕ 清除</button>
         </span>
       </div>
       <table v-if="history.length">
@@ -160,7 +234,10 @@
               {{ h.target_name ? '· ' + h.target_name : '' }}
               <span class="dim">#{{ h.quota_id }}</span>
             </td>
-            <td><span class="act" :class="h.action">{{ actionText(h.action) }}</span></td>
+            <td>
+              <span class="act" :class="h.action">{{ actionText(h.action) }}</span>
+              <button v-if="h.batch_id" class="batch-tag" :title="`查看批次 ${h.batch_id} 的全部逐项留痕`" @click="showBatch(h.batch_id)">批量</button>
+            </td>
             <td class="change">{{ changeText(h) }}</td>
             <td>{{ h.reason || '—' }}</td>
           </tr>
@@ -180,6 +257,12 @@ const canManage = computed(() => store.can('quota_manage'))
 
 const formShow = ref(false)
 const form = ref(emptyForm())
+// 批量策略：套用表单 / 勾选项 / 批量调整参数
+const batchShow = ref(false)
+const batchForm = ref({ scope: 'room', targets: [], period: 'daily', limit_kwh: 1, reason: '' })
+const selectedQuotas = ref([])
+const selectedAlerts = ref([])
+const batchUpd = ref({ limit_kwh: '', period: '', reason: '' })
 const alertFilter = ref('active')
 const alertFilters = [
   { v: 'active', t: '处理中/待处理' },
@@ -190,11 +273,17 @@ const alertFilters = [
 ]
 const history = ref([])
 const historyQuota = ref(null)
+const historyBatch = ref(null)
 
 function emptyForm() {
   return { id: null, scope: 'room', room_id: '', device_id: '', period: 'daily', limit_kwh: 1, reason: '', enabled: true }
 }
-function openCreate() { form.value = emptyForm(); formShow.value = true }
+function openCreate() { form.value = emptyForm(); formShow.value = true; batchShow.value = false }
+function openBatch() {
+  batchForm.value = { scope: 'room', targets: [], period: 'daily', limit_kwh: 1, reason: '' }
+  batchShow.value = true
+  formShow.value = false
+}
 function onScopeChange() { form.value.room_id = ''; form.value.device_id = '' }
 function openEdit(q) {
   form.value = {
@@ -203,10 +292,55 @@ function openEdit(q) {
     period: q.period, limit_kwh: q.limit_kwh, reason: '', enabled: q.enabled
   }
   formShow.value = true
+  batchShow.value = false
 }
 async function submit() {
   const ok = await store.saveQuota(form.value)
   if (ok) { formShow.value = false; await loadHistory() }
+}
+// ===== 批量套用：跨房间/设备统一设置定额 =====
+const batchTargetOptions = computed(() => {
+  if (batchForm.value.scope === 'room') return store.rooms.map((r) => ({ id: r.id, label: r.name }))
+  return store.devices.map((d) => ({ id: d.id, label: `${d.type_icon} ${d.name}（${d.room}）` }))
+})
+const allTargetsChecked = computed(() =>
+  batchTargetOptions.value.length > 0 && batchForm.value.targets.length === batchTargetOptions.value.length)
+function toggleAllTargets() {
+  batchForm.value.targets = allTargetsChecked.value ? [] : batchTargetOptions.value.map((t) => t.id)
+}
+async function submitBatch() {
+  const r = await store.batchApplyQuota(batchForm.value)
+  if (r) { batchShow.value = false; await loadHistory() }
+}
+// ===== 批量调整：勾选的现有定额统一改额度/换周期 =====
+const allQuotasChecked = computed(() =>
+  store.quotas.length > 0 && selectedQuotas.value.length === store.quotas.length)
+function toggleAllQuotas() {
+  selectedQuotas.value = allQuotasChecked.value ? [] : store.quotas.map((q) => q.id)
+}
+async function submitBatchUpdate() {
+  const r = await store.batchUpdateQuotas([...selectedQuotas.value], batchUpd.value)
+  if (r) {
+    selectedQuotas.value = []
+    batchUpd.value = { limit_kwh: '', period: '', reason: '' }
+    await loadHistory()
+  }
+}
+// ===== 批量告警处理 =====
+const allAlertsChecked = computed(() =>
+  filteredAlerts.value.length > 0 && filteredAlerts.value.every((a) => selectedAlerts.value.includes(a.id)))
+function toggleAllAlerts() {
+  selectedAlerts.value = allAlertsChecked.value ? [] : filteredAlerts.value.map((a) => a.id)
+}
+async function batchAct(status) {
+  let note = ''
+  if (status === 'resolved' || status === 'ignored') {
+    const input = prompt(`批量处理备注（${status === 'resolved' ? '已处理' : '忽略'}，将写入每条告警，可留空）：`)
+    if (input === null) return
+    note = input
+  }
+  const r = await store.batchHandleQuotaAlerts([...selectedAlerts.value], status, note)
+  if (r) selectedAlerts.value = []
 }
 async function remove(q) {
   if (confirm(`删除定额「${q.target_name} · ${q.period_label}」？\n未关闭的超标告警将自动解除，历史记录保留。`)) {
@@ -225,15 +359,31 @@ async function act(a, status) {
 }
 async function showHistory(id) {
   historyQuota.value = id
+  historyBatch.value = null
   await loadHistory()
   document.querySelector('.quota')?.scrollIntoView({ behavior: 'smooth' })
 }
+// 整批追溯：按批次号过滤该次批量操作的全部逐项留痕
+function showBatch(batchId) {
+  historyBatch.value = batchId
+  historyQuota.value = null
+  loadHistory()
+}
 async function loadHistory() {
-  history.value = await store.fetchAdjustments(historyQuota.value)
+  history.value = await store.fetchAdjustments(historyQuota.value, historyBatch.value)
 }
 onMounted(loadHistory)
-// 每次 store 轮询刷新后同步全局历史（处于某额度过滤视图时不覆盖）
-watch(() => store.quotaAlerts, () => { if (!historyQuota.value) loadHistory() })
+// 每次 store 轮询刷新后同步全局历史（处于定额/批次过滤视图时不覆盖）；
+// 同时修剪已消失的勾选项（删除定额、告警离开当前筛选等）
+watch(() => store.quotaAlerts, (alerts) => {
+  const ids = new Set(alerts.map((a) => a.id))
+  selectedAlerts.value = selectedAlerts.value.filter((id) => ids.has(id))
+  if (!historyQuota.value && !historyBatch.value) loadHistory()
+})
+watch(() => store.quotas, (qs) => {
+  const ids = new Set(qs.map((q) => q.id))
+  selectedQuotas.value = selectedQuotas.value.filter((id) => ids.has(id))
+})
 
 const openCount = computed(() => store.pendingQuotaAlerts.length)
 const warnCount = computed(() => store.pendingQuotaAlerts.filter((a) => a.level === 'warn').length)
@@ -294,7 +444,10 @@ function changeText(h) {
 .card{background:#0f1b38;border:1px solid rgba(120,160,220,0.16);border-radius:12px;padding:16px;}
 .card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap;}
 h4{margin:0;color:#fff;font-size:14px;}
+.head-ops{display:flex;gap:8px;}
 .add{background:linear-gradient(135deg,#43a047,#2e7d32);border:none;color:#fff;font-weight:600;cursor:pointer;border-radius:8px;padding:7px 14px;font-size:12px;}
+.add.batch{background:linear-gradient(135deg,#2962ff,#1e4fd6);}
+.add:disabled{opacity:.45;cursor:not-allowed;}
 .form{display:flex;gap:8px;flex-wrap:wrap;background:#0c1730;border:1px solid rgba(120,160,220,0.18);border-radius:10px;padding:12px;margin-bottom:12px;align-items:center;}
 select,input,button{font-family:inherit;background:#13233f;border:1px solid rgba(120,160,220,0.2);color:#dbe4f3;border-radius:8px;padding:8px 10px;font-size:12px;}
 .limit-in{display:flex;align-items:center;gap:6px;font-size:12px;color:#8ba2c8;}
@@ -334,6 +487,26 @@ tr.disabled{opacity:.55;}
 .ops .ok-btn{color:#a5d6a7;border-color:rgba(102,187,106,.4);}
 .sub{margin:10px 0 0;font-size:11px;color:#5b6f94;}
 .empty{color:#5b6f94;text-align:center;padding:14px;font-size:12px;}
+/* 批量策略 */
+.batch-form{align-items:flex-start;}
+.target-picker{display:flex;flex-wrap:wrap;gap:6px 14px;max-height:120px;overflow-y:auto;width:100%;background:#0a1428;border:1px solid rgba(120,160,220,0.14);border-radius:8px;padding:8px 10px;}
+.target-picker label{display:flex;align-items:center;gap:5px;font-size:12px;color:#dbe4f3;cursor:pointer;white-space:nowrap;}
+.target-picker .pick-all{color:#90caf9;font-weight:600;}
+.batch-tip{width:100%;margin:2px 0 0;font-size:11px;color:#5b6f94;}
+.batch-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#0c1730;border:1px solid rgba(41,98,255,.35);border-radius:10px;padding:9px 12px;margin-bottom:12px;font-size:12px;color:#90caf9;}
+.batch-bar b{font-size:12px;}
+.batch-bar .limit-in input{width:80px;}
+.batch-bar .reason{flex:1;min-width:140px;}
+.batch-bar .save{background:#2962ff;border:none;color:#fff;cursor:pointer;font-weight:600;padding:6px 12px;}
+.batch-bar .ghost{background:#16263f;color:#8ba2c8;cursor:pointer;padding:6px 12px;}
+.batch-bar button.go{color:#90caf9;border-color:rgba(66,165,245,.4);cursor:pointer;padding:5px 10px;}
+.batch-bar button.ok-btn{color:#a5d6a7;border-color:rgba(102,187,106,.4);cursor:pointer;padding:5px 10px;}
+.batch-bar button:not(.save):not(.ghost){cursor:pointer;padding:5px 10px;}
+.sel{width:30px;text-align:center;}
+.sel input{cursor:pointer;}
+.batch-tag{margin-left:6px;font-size:10px;padding:1px 7px;border-radius:5px;background:#13315c;color:#90caf9;border:1px solid rgba(66,165,245,.35);cursor:pointer;}
+.batch-chip{color:#ffd54f;background:#3a2f12;}
+.batch-chip button{color:#ffd54f;}
 .filters{display:flex;gap:6px;}
 .filters button{cursor:pointer;font-size:11px;padding:5px 10px;}
 .filters button.active{background:#2962ff;border-color:#2962ff;color:#fff;}

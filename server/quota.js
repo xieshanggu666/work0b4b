@@ -10,6 +10,11 @@
 //
 // 周期累计口径：已完成自然日读 energy_daily_* 日固化表（不随 7 天明细清理减少），
 // 当前日读已结明细 + 未结段实时折算（详见 computeUsage）。
+//
+// 批量策略：跨房间/设备统一套用（按对象+周期 upsert）或批量调整现有定额、批量处理告警；
+// 全批共享同一评估时刻、变更全部落库后统一评估一次（无中间态误报），历史告警按既有
+// 规则迁移（换周期结存/阈值校准/回落解除/再越线重开），逐项写 quota_adjustments 并
+// 以 batch_id 归组，可整批追溯。
 
 const TICK_MS = 30_000          // 与 energy.js 模拟节拍一致：持续聚合、及时触发
 const WARN_RATIO = 0.8          // 用量达额度 80% 预警
@@ -131,10 +136,17 @@ export function initQuota(database, notifyFn) {
     old_period TEXT,
     new_period TEXT,
     reason TEXT NOT NULL DEFAULT '',
+    batch_id TEXT,                    -- 批量策略批次号：同一次批量操作的逐项留痕共享，可整批追溯；单项操作为 NULL
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_quota_adjustments_quota ON quota_adjustments(quota_id);
   `)
+  // 旧库迁移：批量策略引入 batch_id 列（逐项审计按批次归组）
+  const adjCols = db.prepare('PRAGMA table_info(quota_adjustments)').all().map((c) => c.name)
+  if (!adjCols.includes('batch_id')) {
+    db.exec('ALTER TABLE quota_adjustments ADD COLUMN batch_id TEXT')
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_quota_adjustments_batch ON quota_adjustments(batch_id)')
   // 告警表：身份唯一键必须包含 period（额度调整周期后旧周期告警结存，新周期另立身份）
   migrateAlertsTable()
   stmts = {
@@ -146,10 +158,16 @@ export function initQuota(database, notifyFn) {
       VALUES (?,?,?,?,?,?,?,?,?)`),
     updateQuota: db.prepare('UPDATE energy_quotas SET limit_kwh=?,period=?,enabled=?,updated_at=? WHERE id=?'),
     deleteQuota: db.prepare('DELETE FROM energy_quotas WHERE id=?'),
+    // 同一对象 + 同一周期的有效额度（唯一性约束：room_id/device_id 缺省按 -1 对齐）
+    quotaByTarget: db.prepare(`SELECT * FROM energy_quotas WHERE scope=? AND period=?
+      AND COALESCE(room_id,-1)=COALESCE(?,-1) AND COALESCE(device_id,-1)=COALESCE(?,-1)`),
     insertAdj: db.prepare(`INSERT INTO quota_adjustments
-      (quota_id,action,old_limit,new_limit,old_period,new_period,reason,created_at)
-      VALUES (?,?,?,?,?,?,?,?)`),
+      (quota_id,action,old_limit,new_limit,old_period,new_period,reason,batch_id,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`),
     adjByQuota: db.prepare('SELECT * FROM quota_adjustments WHERE quota_id=? ORDER BY id DESC LIMIT 30'),
+    adjByBatch: db.prepare(`SELECT a.*, q.scope, q.target_name FROM quota_adjustments a
+                            LEFT JOIN energy_quotas q ON q.id=a.quota_id
+                            WHERE a.batch_id=? ORDER BY a.id DESC LIMIT 100`),
     allAdj: db.prepare(`SELECT a.*, q.scope, q.target_name FROM quota_adjustments a
                         LEFT JOIN energy_quotas q ON q.id=a.quota_id
                         ORDER BY a.id DESC LIMIT 50`),
@@ -315,10 +333,14 @@ export function evaluateAll(at = new Date()) {
 
     const active = alert.status === 'open' || alert.status === 'handling'
     if (!level) {
-      // 额度上调（或自然回落）导致用量低于预警线：该配置下的告警生命周期结束，
-      // 无论此前是活动态还是用户已忽略，统一按系统解除结存（auto_closed=1，允许再越线重开）
-      const reason = `用量已回落至预警线以下（当前额度 ${q.limit_kwh}kWh），告警自动解除`
-      sysClose(alert, reason, () => buildCloseLog(alert, reason))
+      // 额度上调（或自然回落）导致用量低于预警线：该配置下的告警生命周期结束。
+      // 只结存一次：活动态或人工闭环（auto_closed=0）的统一按系统解除（置 auto_closed=1，
+      // 允许再越线重开）；已是系统自动解除的不再重复结存——否则每个评估节拍都会
+      // 重复追加备注、重复写时间线（批量调额后尤其明显的解除误报）。
+      if (!alert.auto_closed) {
+        const reason = `用量已回落至预警线以下（当前额度 ${q.limit_kwh}kWh），告警自动解除`
+        sysClose(alert, reason, () => buildCloseLog(alert, reason))
+      }
     } else if (active) {
       if (alert.level !== level || Math.abs(alert.limit_kwh - q.limit_kwh) >= 0.0001
           || alert.period_end !== end.toISOString()) {
@@ -394,7 +416,9 @@ function snapshotName(scope, roomId, deviceId) {
   return d.name
 }
 
-export function createQuota({ scope, room_id, device_id, period, limit_kwh, reason = '' }) {
+// opts：批量策略复用 —— at 固定评估时刻（全批同一周期窗口口径）、batchId 逐项留痕归组、
+// deferEvaluate 跳过单项评估（批量变更全部落库后统一评估一次，避免中间态误报）
+export function createQuota({ scope, room_id, device_id, period, limit_kwh, reason = '' }, opts = {}) {
   if (!['room', 'device'].includes(scope)) throw new Error('定额对象类型无效')
   if (!['daily', 'weekly', 'monthly'].includes(period)) throw new Error('周期无效')
   const limit = Number(limit_kwh)
@@ -404,22 +428,22 @@ export function createQuota({ scope, room_id, device_id, period, limit_kwh, reas
   const targetName = snapshotName(scope, roomId, deviceId)
 
   // 同一对象 + 同一周期只允许一条有效额度，避免重复告警
-  const dup = db.prepare('SELECT id FROM energy_quotas WHERE scope=? AND period=? AND COALESCE(room_id,-1)=COALESCE(?,-1) AND COALESCE(device_id,-1)=COALESCE(?,-1)')
-    .get(scope, period, roomId, deviceId)
+  const dup = stmts.quotaByTarget.get(scope, period, roomId, deviceId)
   if (dup) throw new Error('该对象在此周期下已有定额，请直接编辑原额度')
 
-  const at = new Date()
+  const at = opts.at || new Date()
   const r = stmts.insertQuota.run(scope, roomId, deviceId, targetName, period, round4(limit), 1,
     at.toISOString(), at.toISOString())
-  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period, reason, at.toISOString())
-  evaluateAll(at)
+  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period, reason,
+    opts.batchId || null, at.toISOString())
+  if (!opts.deferEvaluate) evaluateAll(at)
   return r.lastInsertRowid
 }
 
-export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
+export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }, opts = {}) {
   const q = stmts.quotaById.get(id)
   if (!q) throw new Error('定额不存在')
-  const at = new Date()
+  const at = opts.at || new Date()
   const nextLimit = limit_kwh != null ? Number(limit_kwh) : q.limit_kwh
   const nextPeriod = period ?? q.period
   const nextEnabled = enabled != null ? (enabled ? 1 : 0) : q.enabled
@@ -440,8 +464,8 @@ export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
   stmts.updateQuota.run(round4(nextLimit), nextPeriod, nextEnabled, at.toISOString(), id)
   stmts.insertAdj.run(id, nextEnabled !== q.enabled ? (nextEnabled ? 'enable' : 'disable') : 'update',
     q.limit_kwh, round4(nextLimit), q.period, nextPeriod,
-    reason || changes.join('，'), at.toISOString())
-  evaluateAll(at)
+    reason || changes.join('，'), opts.batchId || null, at.toISOString())
+  if (!opts.deferEvaluate) evaluateAll(at)
   return changes
 }
 
@@ -449,10 +473,132 @@ export function deleteQuota(id, reason = '') {
   const q = stmts.quotaById.get(id)
   if (!q) throw new Error('定额不存在')
   const at = new Date()
-  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, reason, at.toISOString())
+  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, reason, null, at.toISOString())
   stmts.deleteQuota.run(id)
   // 立即解除其未关闭告警
   evaluateAll(at)
+}
+
+// ===== 批量策略：跨房间 / 设备统一套用与调整 =====
+// 设计要点（对应「避免批量变更产生错报」）：
+//  - 全批共享同一时刻 at：周期窗口口径一致，逐项变更全部落库后才统一评估一次，
+//    不存在「改到一半」的中间态被评估触发/解除告警；
+//  - 历史告警迁移沿用 evaluateAll 的校准规则：换周期的旧身份告警按快照结存关闭
+//    （原因写「调整周期」）、当前周期告警按新额度同步级别/阈值/读数、上调回落自动解除、
+//    下调再越线自动重开重报——与单项调整完全同一套行为，批量不产生额外误报；
+//  - 逐项隔离：单个对象校验失败（目标不存在、周期冲突等）只记为该失败，不中断整批；
+//  - 逐项审计：每个实际变更的对象写一条 quota_adjustments（共享 batch_id），
+//    无变化对象记 unchanged 直接跳过，不产生审计噪音，也不触发无谓的告警重校准。
+const BATCH_MAX = 100
+
+function newBatchId(at) {
+  return 'B' + at.getTime().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase()
+}
+
+function normalizeIds(list) {
+  return [...new Set((Array.isArray(list) ? list : []).map(Number).filter((n) => Number.isInteger(n) && n > 0))]
+}
+
+function validateLimit(limit_kwh) {
+  const limit = Number(limit_kwh)
+  if (!Number.isFinite(limit) || limit <= 0 || limit > 100000) throw new Error('额度需为 0-100000 的正数(kWh)')
+  return limit
+}
+
+// 批量套用：对一批房间/设备按「对象+周期」逐条新建或更新额度（已停用的重新启用）
+export function batchApplyQuota({ scope, room_ids, device_ids, period, limit_kwh, reason = '' }) {
+  if (!['room', 'device'].includes(scope)) throw new Error('定额对象类型无效')
+  if (!['daily', 'weekly', 'monthly'].includes(period)) throw new Error('周期无效')
+  const limit = validateLimit(limit_kwh)
+  const ids = normalizeIds(scope === 'room' ? room_ids : device_ids)
+  if (!ids.length) throw new Error('请至少选择一个目标对象')
+  if (ids.length > BATCH_MAX) throw new Error(`单次批量最多 ${BATCH_MAX} 个对象`)
+
+  const at = new Date()
+  const batchId = newBatchId(at)
+  const results = []
+  for (const id of ids) {
+    try {
+      const roomId = scope === 'room' ? id : null
+      const deviceId = scope === 'device' ? id : null
+      const targetName = snapshotName(scope, roomId, deviceId)
+      const existing = stmts.quotaByTarget.get(scope, period, roomId, deviceId)
+      if (existing) {
+        // 额度相同且已启用：无变化，跳过（不写留痕、不触发重校准）
+        if (Math.abs(existing.limit_kwh - round4(limit)) < 0.0001 && existing.enabled) {
+          results.push({ quota_id: existing.id, target_name: targetName, action: 'unchanged', changes: [] })
+          continue
+        }
+        const changes = updateQuota(existing.id, { limit_kwh: limit, enabled: true, reason },
+          { batchId, at, deferEvaluate: true })
+        results.push({ quota_id: existing.id, target_name: targetName, action: 'updated', changes })
+      } else {
+        const quotaId = createQuota(
+          { scope, room_id: roomId, device_id: deviceId, period, limit_kwh: limit, reason },
+          { batchId, at, deferEvaluate: true })
+        results.push({ quota_id: quotaId, target_name: targetName, action: 'created', changes: [`额度 ${round4(limit)}kWh`] })
+      }
+    } catch (e) {
+      results.push({ target_id: id, action: 'failed', error: e.message })
+    }
+  }
+  // 全批变更落库后统一评估：重算实时用量、迁移历史告警（换周期结存/阈值校准/误报解除）
+  evaluateAll(at)
+  return { batch_id: batchId, results }
+}
+
+// 批量调整：对已勾选的一批现有定额统一改额度和/或换周期
+export function batchUpdateQuotas({ quota_ids, limit_kwh, period, reason = '' }) {
+  const ids = normalizeIds(quota_ids)
+  if (!ids.length) throw new Error('请至少选择一条定额')
+  if (ids.length > BATCH_MAX) throw new Error(`单次批量最多 ${BATCH_MAX} 条定额`)
+  if (limit_kwh == null && period == null) throw new Error('请至少填写一项要调整的内容（额度或周期）')
+  const limit = limit_kwh != null ? validateLimit(limit_kwh) : null
+  if (period != null && !['daily', 'weekly', 'monthly'].includes(period)) throw new Error('周期无效')
+
+  const at = new Date()
+  const batchId = newBatchId(at)
+  const results = []
+  for (const id of ids) {
+    try {
+      const q = stmts.quotaById.get(id)
+      if (!q) throw new Error('定额不存在或已删除')
+      const sameLimit = limit == null || Math.abs(q.limit_kwh - round4(limit)) < 0.0001
+      const samePeriod = period == null || q.period === period
+      if (sameLimit && samePeriod) {
+        results.push({ quota_id: id, target_name: q.target_name, action: 'unchanged', changes: [] })
+        continue
+      }
+      const patch = { reason }
+      if (limit != null) patch.limit_kwh = limit
+      if (period != null) patch.period = period
+      // 周期冲突（目标对象在新周期已有定额）等错误由 updateQuota 抛出，逐项隔离记录
+      const changes = updateQuota(id, patch, { batchId, at, deferEvaluate: true })
+      results.push({ quota_id: id, target_name: q.target_name, action: 'updated', changes })
+    } catch (e) {
+      results.push({ quota_id: id, action: 'failed', error: e.message })
+    }
+  }
+  evaluateAll(at)
+  return { batch_id: batchId, results }
+}
+
+// 批量告警处理：同一状态流转逐条套用，单条不合法只记为该失败
+export function batchHandleAlerts({ ids, status, note }) {
+  const idList = normalizeIds(ids)
+  if (!idList.length) throw new Error('请至少选择一条告警')
+  if (idList.length > BATCH_MAX) throw new Error(`单次批量最多处理 ${BATCH_MAX} 条告警`)
+  if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
+  const results = []
+  for (const id of idList) {
+    try {
+      const a = handleAlert(id, { status, note })
+      results.push({ id, target_name: a.target_name, ok: true, status: a.status })
+    } catch (e) {
+      results.push({ id, ok: false, error: e.message })
+    }
+  }
+  return { results }
 }
 
 // ===== 告警处理闭环 =====
@@ -545,8 +691,10 @@ export function listAlerts(at = new Date()) {
   }))
 }
 
-export function getAdjustments(quotaId = null) {
-  const rows = quotaId ? stmts.adjByQuota.all(quotaId) : stmts.allAdj.all()
+export function getAdjustments(quotaId = null, batchId = null) {
+  const rows = batchId
+    ? stmts.adjByBatch.all(batchId)
+    : quotaId ? stmts.adjByQuota.all(quotaId) : stmts.allAdj.all()
   return rows.map((a) => ({
     id: a.id,
     quota_id: a.quota_id,
@@ -558,6 +706,7 @@ export function getAdjustments(quotaId = null) {
     old_period: a.old_period,
     new_period: a.new_period,
     reason: a.reason,
+    batch_id: a.batch_id || null,
     created_at: a.created_at
   }))
 }
