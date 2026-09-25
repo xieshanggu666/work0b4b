@@ -3,7 +3,8 @@ import { db } from './db.js'
 import { initEnergy, reconcileDevice, closeDevice, getSummary } from './energy.js'
 import {
   initQuota, evaluateAll, createQuota, updateQuota, deleteQuota,
-  handleAlert, listQuotas, listAlerts, getAdjustments, activeAlertCount
+  applyBatchQuota, handleAlert, batchHandleAlerts,
+  listQuotas, listAlerts, getAdjustments, activeAlertCount
 } from './quota.js'
 import {
   initFamily, getMemberByToken, listFamily, can,
@@ -302,6 +303,27 @@ app.delete('/api/quota/:id', requirePerm('quota_manage'), (req, res) => {
     res.json({ ok: true })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
+// 批量定额策略：跨房间/设备统一 新建/调整/启停/删除。
+// 服务端单事务落库、末尾统一评估（历史告警迁移 + 实时用量重算），逐项返回成败；
+// 每一项单独写 quota_adjustments 留痕，本接口再写一条汇总时间线（带操作人）。
+const BATCH_ACTION_LABEL = {
+  create: '批量新建定额', update: '批量调整定额', enable: '批量启用定额',
+  disable: '批量停用定额', delete: '批量删除定额'
+}
+app.post('/api/quota/batch', requirePerm('quota_manage'), (req, res) => {
+  try {
+    const { results, applied, failed } = applyBatchQuota(req.body || {})
+    const skipped = results.filter((r) => r.skipped).length
+    const fails = results.filter((r) => !r.ok).map((r) => `${r.label}（${r.message}）`).join('；')
+    log('定额', BATCH_ACTION_LABEL[req.body?.action] || '批量定额操作',
+      `共 ${results.length} 项：生效 ${applied} 项` +
+      (skipped ? `，无变化 ${skipped} 项` : '') +
+      (failed ? `，失败 ${failed} 项：${fails}` : '，全部成功') +
+      (req.body?.reason ? `；备注：${req.body.reason}` : ''),
+      { category: 'quota' })
+    res.json({ ok: failed === 0, applied, failed, results })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
 // 告警处理闭环：待处理 → 处理中 → 已处理/已忽略，可附处理备注
 app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req, res) => {
   try {
@@ -315,6 +337,24 @@ app.post('/api/quota-alert/:id/handle', requirePerm('quota_alert_handle'), (req,
       `${periodLabel}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''),
       { category: 'quota' })
     res.json({ ok: true })
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+// 告警批量处理：同一状态流转 + 同一备注应用到多条告警；
+// 每条成功项单独写家庭日志时间线（带操作人），形成逐项审计
+app.post('/api/quota-alert/batch-handle', requirePerm('quota_alert_handle'), (req, res) => {
+  try {
+    const { ids, status, note } = req.body || {}
+    const { results, applied, failed } = batchHandleAlerts(ids, { status, note })
+    const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: '重新打开/退回' }[status] || '更新状态'
+    const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }
+    for (const r of results) {
+      if (!r.ok) continue
+      const a = r.alert
+      log(r.label, `定额告警·${label}（批量）`,
+        `${periodLabel[a.period] || a.period}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''),
+        { category: 'quota' })
+    }
+    res.json({ ok: failed === 0, applied, failed, results })
   } catch (e) { res.status(400).json({ error: e.message }) }
 })
 // 额度调整历史（不传 quota_id 时为全局最近 50 条）

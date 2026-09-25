@@ -105,6 +105,23 @@ function migrateAlertsTable() {
   db.exec('PRAGMA foreign_keys=ON')
 }
 
+// ===== 调整留痕表补「对象快照」列（旧库迁移） =====
+// 批量策略下每个对象逐项写 quota_adjustments；额度被删除后 LEFT JOIN 拿不到不到对象，
+// 审计会丢失归属。冗余 scope/target_name 快照，删除后历史留痕仍可追溯到房间/设备。
+function migrateAdjustmentsTable() {
+  const cols = db.prepare("PRAGMA table_info(quota_adjustments)").all().map((c) => c.name)
+  if (cols.includes('target_name')) return
+  db.exec(`
+  ALTER TABLE quota_adjustments ADD COLUMN scope TEXT;
+  ALTER TABLE quota_adjustments ADD COLUMN target_name TEXT;
+  -- 回填仍存在的额度快照；已删除额度的历史行保持 NULL（展示为 —）
+  UPDATE quota_adjustments SET
+    scope=(SELECT q.scope FROM energy_quotas q WHERE q.id=quota_adjustments.quota_id),
+    target_name=(SELECT q.target_name FROM energy_quotas q WHERE q.id=quota_adjustments.quota_id)
+  WHERE scope IS NULL;
+  `)
+}
+
 export function initQuota(database, notifyFn) {
   db = database
   if (typeof notifyFn === 'function') notify = notifyFn
@@ -137,6 +154,8 @@ export function initQuota(database, notifyFn) {
   `)
   // 告警表：身份唯一键必须包含 period（额度调整周期后旧周期告警结存，新周期另立身份）
   migrateAlertsTable()
+  // 留痕表：冗余对象快照，批量删除后逐项审计仍可归属
+  migrateAdjustmentsTable()
   stmts = {
     allQuotas: db.prepare('SELECT * FROM energy_quotas ORDER BY id'),
     quotaById: db.prepare('SELECT * FROM energy_quotas WHERE id=?'),
@@ -147,10 +166,11 @@ export function initQuota(database, notifyFn) {
     updateQuota: db.prepare('UPDATE energy_quotas SET limit_kwh=?,period=?,enabled=?,updated_at=? WHERE id=?'),
     deleteQuota: db.prepare('DELETE FROM energy_quotas WHERE id=?'),
     insertAdj: db.prepare(`INSERT INTO quota_adjustments
-      (quota_id,action,old_limit,new_limit,old_period,new_period,reason,created_at)
-      VALUES (?,?,?,?,?,?,?,?)`),
+      (quota_id,action,old_limit,new_limit,old_period,new_period,reason,created_at,scope,target_name)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`),
     adjByQuota: db.prepare('SELECT * FROM quota_adjustments WHERE quota_id=? ORDER BY id DESC LIMIT 30'),
-    allAdj: db.prepare(`SELECT a.*, q.scope, q.target_name FROM quota_adjustments a
+    // 联表列起别名：a.* 已含快照列，LEFT JOIN 未命中（额度已删）时不能用 NULL 覆盖快照
+    allAdj: db.prepare(`SELECT a.*, q.scope q_scope, q.target_name q_target FROM quota_adjustments a
                         LEFT JOIN energy_quotas q ON q.id=a.quota_id
                         ORDER BY a.id DESC LIMIT 50`),
     // 周期内「已完成自然日」的用量读固化日表（不受 7 天明细清理影响）；
@@ -316,7 +336,10 @@ export function evaluateAll(at = new Date()) {
     const active = alert.status === 'open' || alert.status === 'handling'
     if (!level) {
       // 额度上调（或自然回落）导致用量低于预警线：该配置下的告警生命周期结束，
-      // 无论此前是活动态还是用户已忽略，统一按系统解除结存（auto_closed=1，允许再越线重开）
+      // 无论此前是活动态还是用户已忽略，统一按系统解除结存（auto_closed=1，允许再越线重开）。
+      // 幂等：已被系统解除（ignored + auto_closed=1）的告警不再重复关闭——
+      // 否则每个评估节拍都会重复追加备注并刷一条时间线日志，批量调额后尤为明显
+      if (alert.status === 'ignored' && alert.auto_closed) continue
       const reason = `用量已回落至预警线以下（当前额度 ${q.limit_kwh}kWh），告警自动解除`
       sysClose(alert, reason, () => buildCloseLog(alert, reason))
     } else if (active) {
@@ -383,6 +406,9 @@ function buildCloseLog(a, reason) {
 }
 
 // ===== 额度增改删（均留痕） =====
+// 每个操作拆成两层：Raw 版本只落库+留痕、不评估；公开包装在 Raw 之后 evaluateAll 一次。
+// 批量策略（applyBatchQuota）复用 Raw 版本，在事务内连续落库后统一评估一次，
+// 避免逐项评估的中间态（如先降额后换周期）触发错报。
 function snapshotName(scope, roomId, deviceId) {
   if (scope === 'room') {
     const r = stmts.roomName.get(roomId)
@@ -394,7 +420,7 @@ function snapshotName(scope, roomId, deviceId) {
   return d.name
 }
 
-export function createQuota({ scope, room_id, device_id, period, limit_kwh, reason = '' }) {
+function createQuotaRaw({ scope, room_id, device_id, period, limit_kwh, reason = '' }, at = new Date()) {
   if (!['room', 'device'].includes(scope)) throw new Error('定额对象类型无效')
   if (!['daily', 'weekly', 'monthly'].includes(period)) throw new Error('周期无效')
   const limit = Number(limit_kwh)
@@ -408,18 +434,23 @@ export function createQuota({ scope, room_id, device_id, period, limit_kwh, reas
     .get(scope, period, roomId, deviceId)
   if (dup) throw new Error('该对象在此周期下已有定额，请直接编辑原额度')
 
-  const at = new Date()
   const r = stmts.insertQuota.run(scope, roomId, deviceId, targetName, period, round4(limit), 1,
     at.toISOString(), at.toISOString())
-  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period, reason, at.toISOString())
-  evaluateAll(at)
+  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period, reason,
+    at.toISOString(), scope, targetName)
   return r.lastInsertRowid
 }
 
-export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
+export function createQuota(data) {
+  const at = new Date()
+  const id = createQuotaRaw(data, at)
+  evaluateAll(at)
+  return id
+}
+
+function updateQuotaRaw(id, { limit_kwh, period, enabled, reason = '' }, at = new Date()) {
   const q = stmts.quotaById.get(id)
   if (!q) throw new Error('定额不存在')
-  const at = new Date()
   const nextLimit = limit_kwh != null ? Number(limit_kwh) : q.limit_kwh
   const nextPeriod = period ?? q.period
   const nextEnabled = enabled != null ? (enabled ? 1 : 0) : q.enabled
@@ -440,19 +471,134 @@ export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
   stmts.updateQuota.run(round4(nextLimit), nextPeriod, nextEnabled, at.toISOString(), id)
   stmts.insertAdj.run(id, nextEnabled !== q.enabled ? (nextEnabled ? 'enable' : 'disable') : 'update',
     q.limit_kwh, round4(nextLimit), q.period, nextPeriod,
-    reason || changes.join('，'), at.toISOString())
+    reason || changes.join('，'), at.toISOString(), q.scope, q.target_name)
+  return changes
+}
+
+export function updateQuota(id, data) {
+  const at = new Date()
+  const changes = updateQuotaRaw(id, data, at)
   evaluateAll(at)
   return changes
 }
 
-export function deleteQuota(id, reason = '') {
+function deleteQuotaRaw(id, reason = '', at = new Date()) {
   const q = stmts.quotaById.get(id)
   if (!q) throw new Error('定额不存在')
-  const at = new Date()
-  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, reason, at.toISOString())
+  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, reason,
+    at.toISOString(), q.scope, q.target_name)
   stmts.deleteQuota.run(id)
+  return q
+}
+
+export function deleteQuota(id, reason = '') {
+  const at = new Date()
+  deleteQuotaRaw(id, reason, at)
   // 立即解除其未关闭告警
   evaluateAll(at)
+}
+
+// ===== 批量策略：跨房间/设备统一应用，逐项审计 + 末尾统一评估 =====
+// - 全部变更在一个事务内落库，期间不评估；提交后仅 evaluateAll 一次：
+//   历史告警按新周期/新额度整体迁移（旧周期结存关闭、当前周期按新阈值校准/解除/重开），
+//   实时用量一次重算——逐项评估的中间态（如先降额后换周期）不会触发错报。
+// - 每个对象独立校验、独立写 quota_adjustments 留痕（含对象快照，额度删除后仍可追溯）；
+//   单项失败（重复定额、周期冲突、对象不存在）只标记该项，不拖垮整批。
+// - 同批内的重复对象/周期冲突能被前面已落库项正确拦截（同事务可见）。
+const BATCH_ACTIONS = ['create', 'update', 'enable', 'disable', 'delete']
+const BATCH_LIMIT = 100
+
+export function applyBatchQuota({ action, targets, quota_ids, period, limit_kwh, enabled, reason = '' }) {
+  if (!BATCH_ACTIONS.includes(action)) throw new Error('批量操作类型无效')
+  // 共享参数先整体校验：额度/周期非法时整批拒绝（400），而不是逐项报同一错误
+  if (action === 'create' || (action === 'update' && limit_kwh != null && limit_kwh !== '')) {
+    const limit = Number(limit_kwh)
+    if (!Number.isFinite(limit) || limit <= 0 || limit > 100000) throw new Error('额度需为 0-100000 的正数(kWh)')
+  }
+  if (action === 'create' || (action === 'update' && period)) {
+    if (!['daily', 'weekly', 'monthly'].includes(period)) throw new Error('周期无效')
+  }
+
+  // 统一目标清单：create 按对象描述（房间/设备），其余按既有额度 id
+  let items = []
+  if (action === 'create') {
+    if (!Array.isArray(targets) || !targets.length) throw new Error('请选择至少一个房间或设备')
+    if (targets.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 个对象`)
+    items = targets.map((t) => ({ kind: 'create', target: t || {} }))
+  } else {
+    if (!Array.isArray(quota_ids) || !quota_ids.length) throw new Error('请选择至少一条定额')
+    if (quota_ids.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 条定额`)
+    items = quota_ids.map((id) => ({ kind: action, quotaId: Number(id) }))
+  }
+
+  const at = new Date()
+  const results = []
+  const targetLabel = (t) => {
+    if (t.scope === 'room') return `房间·${stmts.roomName.get(Number(t.room_id))?.name ?? `#${t.room_id}`}`
+    const d = db.prepare('SELECT name FROM devices WHERE id=?').get(Number(t.device_id))
+    return `设备·${d?.name ?? `#${t.device_id}`}`
+  }
+
+  db.exec('BEGIN')
+  try {
+    for (const it of items) {
+      if (it.kind === 'create') {
+        const label = targetLabel(it.target)
+        try {
+          const id = createQuotaRaw({ ...it.target, period, limit_kwh, reason }, at)
+          const q = stmts.quotaById.get(id)
+          results.push({ ok: true, label, action, quota_id: id, message: `已创建 ${PERIOD_LABEL[q.period]} ${q.limit_kwh}kWh` })
+        } catch (e) {
+          results.push({ ok: false, label, action, message: e.message })
+        }
+        continue
+      }
+      const q = stmts.quotaById.get(it.quotaId)
+      const label = q ? `${q.scope === 'room' ? '房间' : '设备'}·${q.target_name}` : `定额#${it.quotaId}`
+      try {
+        if (!q) throw new Error('定额不存在')
+        if (it.kind === 'delete') {
+          deleteQuotaRaw(q.id, reason, at)
+          results.push({ ok: true, label, action, quota_id: q.id, message: '已删除，未关闭告警自动解除' })
+        } else if (it.kind === 'enable' || it.kind === 'disable') {
+          const want = it.kind === 'enable' ? 1 : 0
+          if (q.enabled === want) {
+            results.push({ ok: true, skipped: true, label, action, quota_id: q.id, message: `已处于${want ? '启用' : '停用'}状态，无变化` })
+          } else {
+            updateQuotaRaw(q.id, { enabled: !!want, reason }, at)
+            results.push({ ok: true, label, action, quota_id: q.id, message: want ? '已启用' : '已停用，未关闭告警自动解除' })
+          }
+        } else {
+          // update：周期/额度留空表示该项保持不变；三项都无变化则跳过（不写留痕，避免审计噪音）
+          const patch = { reason }
+          if (limit_kwh != null && limit_kwh !== '') patch.limit_kwh = limit_kwh
+          if (period) patch.period = period
+          if (enabled != null) patch.enabled = enabled
+          const noLimit = patch.limit_kwh == null || round4(Number(patch.limit_kwh)) === q.limit_kwh
+          const noPeriod = !patch.period || patch.period === q.period
+          const noEnabled = patch.enabled == null || (patch.enabled ? 1 : 0) === q.enabled
+          if (noLimit && noPeriod && noEnabled) {
+            results.push({ ok: true, skipped: true, label, action, quota_id: q.id, message: '无变化' })
+          } else {
+            const changes = updateQuotaRaw(q.id, patch, at)
+            results.push({ ok: true, label, action, quota_id: q.id, message: changes.join('，') || '已调整' })
+          }
+        }
+      } catch (e) {
+        results.push({ ok: false, label, action, quota_id: q?.id ?? it.quotaId, message: e.message })
+      }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+
+  // 全批落库后统一评估一次：历史告警迁移校准 + 实时用量重算，杜绝中间态错报
+  evaluateAll(at)
+  const applied = results.filter((r) => r.ok && !r.skipped).length
+  const failed = results.filter((r) => !r.ok).length
+  return { results, applied, failed }
 }
 
 // ===== 告警处理闭环 =====
@@ -489,6 +635,35 @@ export function handleAlert(id, { status, note }) {
     : null
   stmts.manualAlert.run(status, nextNote, handled, at.toISOString(), id)
   return stmts.alertById.get(id)
+}
+
+// ===== 告警批量处理：同一状态流转 + 同一备注应用到多条告警 =====
+// 逐条复用 handleAlert 的完整状态机校验（含重新打开前的周期/越线复核），
+// 单条不合法（如已闭环告警不能「开始处理」）只标记该条，不拖垮整批；
+// 每条成功项由调用方写入家庭日志时间线，形成逐项审计。
+export function batchHandleAlerts(ids, { status, note }) {
+  if (!Array.isArray(ids) || !ids.length) throw new Error('请选择至少一条告警')
+  if (ids.length > BATCH_LIMIT) throw new Error(`单次批量最多 ${BATCH_LIMIT} 条告警`)
+  if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
+  const results = []
+  for (const rawId of ids) {
+    const id = Number(rawId)
+    const before = stmts.alertById.get(id)
+    const label = before
+      ? `${before.scope === 'room' ? '房间' : '设备'}·${before.target_name}`
+      : `告警#${rawId}`
+    if (!before) {
+      results.push({ ok: false, id, label, message: '告警不存在' })
+      continue
+    }
+    try {
+      const after = handleAlert(id, { status, note })
+      results.push({ ok: true, id, label, message: `已流转为「${STATUS_LABEL[after.status]}」`, alert: after })
+    } catch (e) {
+      results.push({ ok: false, id, label, message: e.message })
+    }
+  }
+  return { results, applied: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length }
 }
 
 // ===== 给 /api/state 的序列化视图 =====
@@ -550,8 +725,9 @@ export function getAdjustments(quotaId = null) {
   return rows.map((a) => ({
     id: a.id,
     quota_id: a.quota_id,
-    scope: a.scope || null,
-    target_name: a.target_name || null,
+    // 优先取留痕时的对象快照（额度删除后仍可归属），旧数据回退联表值
+    scope: a.scope ?? a.q_scope ?? null,
+    target_name: a.target_name ?? a.q_target ?? null,
     action: a.action,
     old_limit: a.old_limit,
     new_limit: a.new_limit,

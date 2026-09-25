@@ -213,6 +213,29 @@ export const useHomeStore = defineStore('home', {
         this.toastMsg('告警状态已更新', 'success')
       } catch (e) { this.toastMsg(e.message, 'warn') }
     },
+    // 批量定额策略：跨房间/设备统一 新建/调整/启停/删除。
+    // 返回逐项结果（含失败原因）供页面展示审计明细；整批失败原因由 toast 汇总
+    async batchQuota(payload) {
+      try {
+        const r = await api('/quota/batch', 'POST', payload)
+        await this.load()
+        this.toastMsg(
+          `批量操作完成：生效 ${r.applied} 项` + (r.failed ? `，失败 ${r.failed} 项` : ''),
+          r.failed ? 'warn' : 'success')
+        return r
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
+    // 批量告警处理：同一状态流转 + 同一备注应用到多条告警，逐项返回成败
+    async batchHandleQuotaAlerts(ids, patch) {
+      try {
+        const r = await api('/quota-alert/batch-handle', 'POST', { ids, ...patch })
+        await this.load()
+        this.toastMsg(
+          `批量处理完成：成功 ${r.applied} 条` + (r.failed ? `，失败 ${r.failed} 条` : ''),
+          r.failed ? 'warn' : 'success')
+        return r
+      } catch (e) { this.toastMsg(e.message, 'warn'); return null }
+    },
     async fetchAdjustments(quotaId = null) {
       const qs = quotaId ? `?quota_id=${quotaId}` : ''
       return await api('/quota-adjustments' + qs)
